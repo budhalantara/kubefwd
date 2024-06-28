@@ -32,6 +32,7 @@ import (
 	"github.com/txn2/kubefwd/pkg/fwdport"
 	"github.com/txn2/kubefwd/pkg/fwdservice"
 	"github.com/txn2/kubefwd/pkg/fwdsvcregistry"
+	"github.com/txn2/kubefwd/pkg/profile"
 	"github.com/txn2/kubefwd/pkg/utils"
 	"github.com/txn2/txeh"
 
@@ -59,6 +60,7 @@ var mappings []string
 var isAllNs bool
 var fwdConfigurationPath string
 var fwdReservations []string
+var profilePath string
 
 func init() {
 	// override error output from k8s.io/apimachinery/pkg/util/runtime
@@ -78,6 +80,7 @@ func init() {
 	Cmd.Flags().BoolVarP(&isAllNs, "all-namespaces", "A", false, "Enable --all-namespaces option like kubectl.")
 	Cmd.Flags().StringSliceVarP(&fwdReservations, "reserve", "r", []string{}, "Specify an IP reservation. Specify multiple reservations by duplicating this argument.")
 	Cmd.Flags().StringVarP(&fwdConfigurationPath, "fwd-conf", "z", "", "Define an IP reservation configuration")
+	Cmd.Flags().StringVarP(&profilePath, "profile", "p", "", "Profile path")
 
 }
 
@@ -160,16 +163,16 @@ func runCmd(cmd *cobra.Command, _ []string) {
 
 	if !hasRoot {
 		log.Errorf(`
-This program requires superuser privileges to run. These
-privileges are required to add IP address aliases to your
-loopback interface. Superuser privileges are also needed
-to listen on low port numbers for these IP addresses.
+	This program requires superuser privileges to run. These
+	privileges are required to add IP address aliases to your
+	loopback interface. Superuser privileges are also needed
+	to listen on low port numbers for these IP addresses.
 
-Try:
- - sudo -E kubefwd services (Unix)
- - Running a shell with administrator rights (Windows)
+	Try:
+	 - sudo -E kubefwd services (Unix)
+	 - Running a shell with administrator rights (Windows)
 
-`)
+	`)
 		if err != nil {
 			log.Fatalf("Root check failure: %s", err.Error())
 		}
@@ -223,6 +226,19 @@ Try:
 	listOptions := metav1.ListOptions{}
 	listOptions.LabelSelector = cmd.Flag("selector").Value.String()
 	listOptions.FieldSelector = cmd.Flag("field-selector").Value.String()
+
+	var profileCfg *profile.Config
+	if profilePath != "" {
+		profileCfg, err = profile.LoadConfig(profilePath)
+		if err != nil {
+			log.Fatalf("Error loading profile: %s\n", err.Error())
+		}
+
+		log.Printf("Loaded profile %s %s\n", profilePath, profileCfg.Name)
+
+		namespaces = append(namespaces, profileCfg.GetNamespaces()...)
+		contexts = append(contexts, profileCfg.Context)
+	}
 
 	// if no namespaces were specified via the flags, check config from the k8s context
 	// then explicitly set one to "default"
@@ -305,6 +321,15 @@ Try:
 		for ii, namespace := range namespaces {
 			nsWatchesDone.Add(1)
 
+			forwardedServices := map[string]ForwardedService{}
+			if profileCfg != nil {
+				for _, svc := range profileCfg.Services[namespace] {
+					forwardedServices[svc.Name] = ForwardedService{
+						Name: svc.Name,
+					}
+				}
+			}
+
 			nameSpaceOpts := NamespaceOpts{
 				ClientSet: *clientSet,
 				Context:   ctx,
@@ -322,6 +347,7 @@ Try:
 				Domain:            domain,
 				ManualStopChannel: stopListenCh,
 				PortMapping:       mappings,
+				ForwardedServices: forwardedServices,
 			}
 
 			go func(npo NamespaceOpts) {
@@ -373,6 +399,12 @@ type NamespaceOpts struct {
 	PortMapping []string
 
 	ManualStopChannel chan struct{}
+
+	ForwardedServices map[string]ForwardedService
+}
+
+type ForwardedService struct {
+	Name string
 }
 
 // watchServiceEvents sets up event handlers to act on service-related events.
@@ -420,6 +452,12 @@ func (opts *NamespaceOpts) AddServiceHandler(obj interface{}) {
 		return
 	}
 
+	_, ok = opts.ForwardedServices[svc.Name]
+	if !ok && len(opts.ForwardedServices) > 0 {
+		log.Debugf("Service %s.%s is not in the list of services to forward, skipping\n", svc.Name, svc.Namespace)
+		return
+	}
+
 	// Check if service has a valid config to do forwarding
 	selector := labels.Set(svc.Spec.Selector).AsSelector().String()
 	if selector == "" {
@@ -458,6 +496,11 @@ func (opts *NamespaceOpts) AddServiceHandler(obj interface{}) {
 func (opts *NamespaceOpts) DeleteServiceHandler(obj interface{}) {
 	svc, ok := obj.(*v1.Service)
 	if !ok {
+		return
+	}
+
+	_, ok = opts.ForwardedServices[svc.Name]
+	if !ok && len(opts.ForwardedServices) > 0 {
 		return
 	}
 

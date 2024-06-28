@@ -1,0 +1,9 @@
+name: profile-name
+context: context-name
+services:
+  namespace1:
+    - name: service-name-1
+    - name: service-name-2
+  namespace2:
+    - name: service-name-1
+    - name: service-name-2
